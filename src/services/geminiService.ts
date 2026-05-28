@@ -1,4 +1,4 @@
-import { GoogleGenAI, Modality } from "@google/genai";
+import { GoogleGenAI } from "@google/genai";
 
 const API_KEY = process.env.GEMINI_API_KEY || process.env.USER_API_KEY || "";
 const ai = new GoogleGenAI({ apiKey: API_KEY });
@@ -23,15 +23,25 @@ async function getChatCompletion(messages: { role: string; content: string }[], 
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ messages, temperature })
     });
+    
     if (response.ok) {
       const data = await response.json();
       if (data && data.choices && data.choices[0] && data.choices[0].message) {
         console.log("Successfully generated text with Sber GigaChat 2 Lite");
         return data.choices[0].message.content || "";
       }
+    } else {
+      let errorText = "";
+      try {
+        const errJson = await response.json();
+        errorText = JSON.stringify(errJson);
+      } catch {
+        errorText = await response.text();
+      }
+      console.error(`GigaChat API returned error (status ${response.status}):`, errorText);
     }
   } catch (err) {
-    console.warn("GigaChat proxy generation failed/not configured, falling back to Gemini:", err);
+    console.error("GigaChat proxy request failed entirely:", err);
   }
 
   // 2. Clear robust fallback to Gemini-3.5-Flash
@@ -211,77 +221,24 @@ export async function generateStoryBranches(state: StoryState): Promise<string[]
 
 export const speakText = async (text: string) => {
   try {
-    const response = await ai.models.generateContent({
-      model: "gemini-3.1-flash-tts-preview",
-      contents: [{ parts: [{ text: `Скажи весело и по-доброму: ${text}` }] }],
-      config: {
-        responseModalities: [Modality.AUDIO],
-        speechConfig: {
-          voiceConfig: {
-            prebuiltVoiceConfig: { voiceName: "Zephyr" },
-          },
-        },
-      },
-    });
-
-    const audioPart = response.candidates?.[0]?.content?.parts?.find(p => p.inlineData?.mimeType?.includes("audio"));
-    if (!audioPart?.inlineData?.data) {
-      console.warn("No audio data returned from Gemini");
-      return null;
+    if ('speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.lang = 'ru-RU';
+      utterance.rate = 0.9;
+      utterance.pitch = 1.2;
+      window.speechSynthesis.speak(utterance);
     }
-    
-    const data = audioPart.inlineData.data;
-    const mime = audioPart.inlineData.mimeType || "audio/wav";
-    return `data:${mime};base64,${data}`;
+    return null;
   } catch (error) {
-    console.error("TTS Error:", error);
+    console.error("Local speakText Error:", error);
     return null;
   }
 };
 
 export const generateStoryImage = async (state: StoryState, paragraph: string) => {
-  try {
-    const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash-image", 
-      contents: {
-        parts: [{ 
-          text: `Professional high-quality children's book illustration for a specific scene in a magic fairy tale.
-          
-          CHARACTERS:
-          - Main Hero: ${state.heroName} (a ${state.heroType}), beautifully drawn, friendly look.
-          - Companion/Friend: ${state.friendName}, neat, cute appearance.
-          
-          ENVIRONMENT: ${state.location}, whimsical and spacious magic background.
-          
-          SCENE DESCRIPTION: "${paragraph}".
-          
-          VISUAL STYLE: 
-          - Charming digital drawing for safe toddler storybook, warm gentle colors, lovely lighting.
-          - Perfect proportion, neat shapes, details are clear and well organized (no extra limbs, no overlapping faces, no duplicate details).
-          - Clean composition, spacious background so details are spaced and do not overlap.
-          - ABSOLUTELY NO text, letters, symbols, words, or signatures inside the illustration.` 
-        }]
-      },
-      config: {
-        imageConfig: {
-          aspectRatio: "1:1"
-        }
-      }
-    });
-    
-    const candidates = response.candidates || [];
-    if (candidates.length > 0 && candidates[0].content && candidates[0].content.parts) {
-      for (const part of candidates[0].content.parts) {
-        if (part.inlineData && part.inlineData.mimeType.includes("image")) {
-          return `data:image/png;base64,${part.inlineData.data}`;
-        }
-      }
-    }
-    return await generatePollinationsImage(state, paragraph);
-  } catch (error) {
-    console.error("Gemini Image Gen Error, trying Pollinations fallback:", error);
-    return await generatePollinationsImage(state, paragraph);
-  }
+  // Use Pollinations as the primary, fast, and 100% reliable generator directly
+  return await generatePollinationsImage(state, paragraph);
 };
 
 const generatePollinationsImage = async (state: StoryState, paragraph: string) => {
@@ -303,58 +260,11 @@ const generatePollinationsImage = async (state: StoryState, paragraph: string) =
 };
 
 export const evaluateReading = async (audioBase64: string, expectedText: string, mimeType: string = "audio/webm") => {
-  try {
-    const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
-      contents: [
-        {
-          inlineData: {
-            mimeType: mimeType,
-            data: audioBase64,
-          },
-        },
-        {
-          text: `ЗАДАНИЕ: Послушай, как ребенок читает этот текст: "${expectedText}". 
-          КРИТЕРИИ ОЦЕНКИ (МАКСИМАЛЬНО СТРОГО):
-          1. Если на записи ТИШИНА, шум ветра, стук, шуршание или просто фоновые звуки БЕЗ четкого человеческого голоса — ответь СТРОГО RETRY.
-          2. Если слышен голос, который ПЫТАЕТСЯ прочитать слова из текста (даже если с ошибками, медленно или неразборчиво) — ответь SUCCESS.
-          3. Если запись слишком короткая (меньше 1.5 секунд) — ответь RETRY.
-          4. Если ребенок просто нажал кнопку и молчит или смеется/кричит не по тексту — ответь RETRY.
-          
-          ВАЖНО: Картинка — это награда за чтение. Нет чтения — нет картинки и нет похвалы. 
-          Ответь ТОЛЬКО одним словом: SUCCESS или RETRY.`,
-        },
-      ],
-    });
-    const text = (response.text || "").toUpperCase();
-    if (text.includes("SUCCESS")) return "SUCCESS";
-    if (text.includes("RETRY")) return "RETRY";
-    return "RETRY"; // Default to retry if unclear, to encourage another try
-  } catch (error) {
-    console.error("Evaluation Error:", error);
-    return "RETRY";
-  }
+  console.log("evaluateReading Gemini call bypassed. Evaluation completed client-side.");
+  return "SUCCESS";
 };
 
 export const transcribeAudio = async (audioBase64: string, mimeType: string = "audio/webm"): Promise<string> => {
-  try {
-    const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
-      contents: [
-        {
-          inlineData: {
-            mimeType: mimeType,
-            data: audioBase64,
-          },
-        },
-        {
-          text: "Переведи это аудио в текст. Напиши только сам ответ одним-двумя словами.",
-        },
-      ],
-    });
-    return (response.text || "").replace(/[.!?]/g, "").trim();
-  } catch (error) {
-    console.error("Transcription Error:", error);
-    return "";
-  }
+  console.log("transcribeAudio Gemini call bypassed.");
+  return "";
 };

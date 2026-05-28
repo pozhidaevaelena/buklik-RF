@@ -222,37 +222,6 @@ export default function App() {
   const recognitionRef = useRef<any>(null);
 
   useEffect(() => {
-    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    if (SpeechRecognition) {
-      const recognition = new SpeechRecognition();
-      recognition.continuous = false;
-      recognition.interimResults = false;
-      recognition.lang = 'ru-RU';
-      
-      recognition.onresult = (event: any) => {
-        const text = event.results[0][0].transcript;
-        handleStep(text);
-      };
-
-      recognition.onerror = (event: any) => {
-        console.error("Speech Recognition Error:", event.error);
-        setIsRecording(false);
-        setEmotion('idle');
-      };
-
-      recognition.onend = () => {
-        setIsRecording(false);
-      };
-
-      recognitionRef.current = recognition;
-    }
-  }, []);
-
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const audioChunksRef = useRef<Blob[]>([]);
-  const audioPlayerRef = useRef<HTMLAudioElement | null>(null);
-
-  useEffect(() => {
     if (buklikText && voiceEnabled) {
       // Don't auto-speak long story paragraphs unless specifically requested to avoid overwhelming 
       // but do auto-speak Buklik's instructions
@@ -286,60 +255,76 @@ export default function App() {
 
   const startRecording = async () => {
     window.speechSynthesis.cancel();
-    // Use SpeechRecognition for intro steps
-    if (stage !== 'STORY_TIME' && recognitionRef.current) {
-      try {
-        recognitionRef.current.start();
-        setIsRecording(true);
-        setEmotion('listening');
-      } catch (e) {
-        console.error("Recognition start error", e);
-      }
+    
+    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      console.warn("Speech Recognition not supported in this browser");
+      setBuklikText("Ой, твой браузер не поддерживает распознавание голоса. Открой Буклика в Google Chrome!");
+      handleSpeak("Ой, твой браузер не поддерживает распознавание голоса. Открой Буклика в Google Chrome!");
       return;
     }
 
-    // Use MediaRecorder for story reading evaluation (Gemini multimodal)
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const mimeType = MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : 'audio/mp4';
-      const mediaRecorder = new MediaRecorder(stream, { mimeType });
-      mediaRecorderRef.current = mediaRecorder;
-      audioChunksRef.current = [];
-      setEmotion('listening');
-      mediaRecorder.ondataavailable = (e) => e.data.size > 0 && audioChunksRef.current.push(e.data);
-      mediaRecorder.onstop = async () => {
-        if (audioChunksRef.current.length === 0) return;
-        const audioBlob = new Blob(audioChunksRef.current, { type: mimeType });
-        if (audioBlob.size < 5000) {
-           setBuklikText(`${storyState.childName}, кажется, ты ничего не сказал! Нажми подольше и прочти текст вслух.`);
-           return;
-        }
-        const reader = new FileReader();
-        reader.readAsDataURL(audioBlob);
-        reader.onloadend = async () => {
-          const base64 = (reader.result as string).split(',')[1];
-          processReading(base64, mimeType);
-        };
-      };
-      mediaRecorder.start();
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.stop();
+      } catch (e) {}
+    }
+
+    const recognition = new SpeechRecognition();
+    recognition.continuous = false;
+    recognition.interimResults = false;
+    recognition.lang = 'ru-RU';
+
+    recognition.onstart = () => {
       setIsRecording(true);
-    } catch (err) {
-      setBuklikText("Ой, я не могу включить микрофон! Разреши доступ в настройках браузера.");
+      setEmotion('listening');
+    };
+
+    recognition.onresult = (event: any) => {
+      const text = event.results[0][0].transcript;
+      setIsRecording(false);
+      
+      if (stage === 'STORY_TIME') {
+        checkReading(text);
+      } else {
+        handleStep(text);
+      }
+    };
+
+    recognition.onerror = (event: any) => {
+      console.error("Speech Recognition Error:", event.error);
+      setIsRecording(false);
+      setEmotion('idle');
+      if (stage === 'STORY_TIME') {
+        const errorMsg = "Ой, я тебя не расслышал, дружок. Давай попробуем еще раз! Нажми микрофон и прочитай выразительно.";
+        setBuklikText(errorMsg);
+        handleSpeak(errorMsg);
+      }
+    };
+
+    recognition.onend = () => {
+      setIsRecording(false);
+    };
+
+    recognitionRef.current = recognition;
+
+    try {
+      recognition.start();
+    } catch (e) {
+      console.error("Speech Recognition starting failed:", e);
     }
   };
 
   const stopRecording = () => {
-    if (stage !== 'STORY_TIME' && recognitionRef.current) {
-      recognitionRef.current.stop();
-      setIsRecording(false);
-      return;
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.stop();
+      } catch (e) {
+        console.error("Failed to stop recognition:", e);
+      }
     }
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
-      mediaRecorderRef.current.stop();
-      setIsRecording(false);
-      setEmotion('thinking');
-      mediaRecorderRef.current.stream.getTracks().forEach(track => track.stop());
-    }
+    setIsRecording(false);
+    setEmotion('idle');
   };
 
   const handleStep = async (value: string) => {
@@ -435,13 +420,41 @@ export default function App() {
     `Молодец, ${storyState.childName}! Твой голос такой приятный, мне очень нравится тебя слушать!`
   ];
 
-  const processReading = async (base64Audio: string, mimeType: string) => {
+  const checkReading = async (spokenText: string) => {
     setIsProcessing(true);
     setEmotion('thinking');
     const currentPara = storyState.paragraphs[storyState.currentParagraphIndex];
+    if (!currentPara) {
+      setIsProcessing(false);
+      return;
+    }
+
     try {
-      const result = await evaluateReading(base64Audio, currentPara, mimeType);
-      if (result === 'SUCCESS') {
+      // Clean texts and compare
+      const cleanExpected = currentPara.toLowerCase().replace(/[^a-zA-Zа-яА-ЯёЁ0-9\s]/g, '');
+      const cleanSpoken = spokenText.toLowerCase().replace(/[^a-zA-Zа-яА-ЯёЁ0-9\s]/g, '');
+      
+      let matches = 0;
+      const expectedWords = cleanExpected.split(/\s+/).filter(Boolean);
+      const spokenWords = cleanSpoken.split(/\s+/).filter(Boolean);
+      
+      for (const word of spokenWords) {
+        if (expectedWords.some(w => w.includes(word) || word.includes(w))) {
+          matches++;
+        }
+      }
+      
+      const matchPercent = expectedWords.length > 0 ? (matches / expectedWords.length) : 0;
+      
+      console.log("Reading comparison metric:", {
+        expected: currentPara,
+        spoken: spokenText,
+        matches,
+        expectedCount: expectedWords.length,
+        matchPercent
+      });
+
+      if (matchPercent > 0.3 || cleanSpoken.length > (cleanExpected.length * 0.3)) {
         const randomPraise = praises[Math.floor(Math.random() * praises.length)];
         
         setIsReadingCorrectly(true);
@@ -982,7 +995,7 @@ export default function App() {
           </AnimatePresence>
         </div>
 
-        <audio ref={audioPlayerRef} className="hidden" />
+
 
         <footer className="mt-8 md:mt-16 text-center text-white/90 font-black space-y-4 md:space-y-8 w-full pb-8 md:pb-12">
           <div className="flex justify-center gap-6 md:gap-12">
